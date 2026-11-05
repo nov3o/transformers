@@ -1314,9 +1314,9 @@ def _default_read_ahead_bytes() -> int:
 
 
 def _read_into_memory(tensor) -> torch.Tensor:
-    # With the mmap backend, slicing only maps the file: the read from disk happens on first touch. Copy into memory
-    # here, so that the read happens on the worker thread and not later on the main thread.
-    return tensor[...].clone()
+    # Checkpoints are opened with the pread backend for on-the-fly quantization, so slicing reads from disk here, on
+    # the worker thread
+    return tensor[...]
 
 
 class ReadAhead:

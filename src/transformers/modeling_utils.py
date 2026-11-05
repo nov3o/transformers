@@ -4551,6 +4551,10 @@ class PreTrainedModel(
                         backend, device = "pread", "mps"
                     elif sys.platform == "win32":
                         backend, device = "pread", "cpu"
+                    elif load_config.hf_quantizer is not None and not load_config.hf_quantizer.pre_quantized:
+                        # On-the-fly quantization reads ahead on worker threads (see `ReadAhead`): pread reads each
+                        # tensor in one call, ~4x faster per thread than faulting in mmap pages
+                        backend, device = "pread", "cpu"
                     else:
                         backend, device = "mmap", "cpu"
                     file_pointer = safe_open(file, framework="pt", device=device, backend=backend)
