@@ -1313,9 +1313,71 @@ def _default_read_ahead_bytes() -> int:
     return min(16 << 30, free // 4)
 
 
+_SAFETENSORS_TORCH_DTYPE = {
+    "F64": torch.float64, "F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64,
+    "I32": torch.int32, "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
+    "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
+}  # fmt: skip
+
+
+def safetensors_file_tensors(path: str, slices: dict) -> dict:
+    """`FileTensor`s for the tensors of a safetensors file, from its header; `slices` are the regular safetensors
+    slices, used for anything but reading a whole tensor."""
+    import json
+    import struct
+
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(n))
+    out = {}
+    for key, info in header.items():
+        if key == "__metadata__" or key not in slices or info["dtype"] not in _SAFETENSORS_TORCH_DTYPE:
+            continue
+        start, end = info["data_offsets"]
+        out[key] = FileTensor(path, info["dtype"], info["shape"], 8 + n + start, end - start, slices[key])
+    return out
+
+
+class FileTensor:
+    """A checkpoint tensor as its byte range in a safetensors file. Reading it whole (`t[...]`) is one `preadv` into
+    pinned memory: unlike faulting in mmap pages, this scales with threads (it releases the GIL and takes no mmap
+    lock). Any other indexing goes to the regular safetensors slice."""
+
+    def __init__(self, path, dtype, shape, offset, nbytes, fallback):
+        self.path, self.dtype, self.shape, self.offset, self.nbytes, self.fallback = path, dtype, shape, offset, nbytes, fallback
+
+    def get_shape(self):
+        return list(self.shape)
+
+    def get_dtype(self):
+        return self.dtype
+
+    def read(self) -> torch.Tensor:
+        buf = torch.empty(self.nbytes, dtype=torch.uint8, pin_memory=torch.cuda.is_available())
+        view, done = memoryview(buf.numpy()), 0
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+            while done < self.nbytes:
+                n = os.preadv(fd, [view[done:]], self.offset + done)
+                if n == 0:
+                    raise OSError(f"unexpected end of file in {self.path}")
+                done += n
+        finally:
+            os.close(fd)
+        return buf.view(_SAFETENSORS_TORCH_DTYPE[self.dtype]).reshape(self.shape)
+
+    def __getitem__(self, index):
+        if index is Ellipsis or index == ():
+            return self.read()
+        return self.fallback[index]
+
+
 def _read_to_device(tensor, device) -> torch.Tensor:
     # With the mmap backend, slicing only maps the file: the read from disk happens when the bytes are first touched,
     # here by the copy to the device, so the read happens on the worker thread
+    if isinstance(tensor, FileTensor):
+        tensor = tensor.read()
+        return tensor.to(device, non_blocking=True) if device is not None else tensor
     tensor = tensor[...]
     return tensor.to(device) if device is not None else tensor.clone()
 
