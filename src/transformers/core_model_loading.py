@@ -1313,6 +1313,12 @@ def _default_read_ahead_bytes() -> int:
     return min(16 << 30, free // 4)
 
 
+def _read_into_memory(tensor) -> torch.Tensor:
+    # With the mmap backend, slicing only maps the file: the read from disk happens on first touch. Copy into memory
+    # here, so that the read happens on the worker thread and not later on the main thread.
+    return tensor[...].clone()
+
+
 class ReadAhead:
     """Reads checkpoint tensors into CPU memory on worker threads, in the order they were added, ahead of the main
     thread, with at most `budget` bytes read but not yet taken. Moving to the device, casting and quantizing stay on
@@ -1340,7 +1346,7 @@ class ReadAhead:
                 job = self.waiting.popleft()
                 if job.taken:
                     continue
-                job.future = self.pool.submit(_materialize_copy, job.tensor)
+                job.future = self.pool.submit(_read_into_memory, job.tensor)
                 self.in_flight += job.nbytes
 
     def _release(self, nbytes: int):
