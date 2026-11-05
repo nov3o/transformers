@@ -1313,10 +1313,11 @@ def _default_read_ahead_bytes() -> int:
     return min(16 << 30, free // 4)
 
 
-def _read_into_memory(tensor) -> torch.Tensor:
-    # Checkpoints are opened with the pread backend for on-the-fly quantization, so slicing reads from disk here, on
-    # the worker thread
-    return tensor[...]
+def _read_to_device(tensor, device) -> torch.Tensor:
+    # With the mmap backend, slicing only maps the file: the read from disk happens when the bytes are first touched,
+    # here by the copy to the device, so the read happens on the worker thread
+    tensor = tensor[...]
+    return tensor.to(device) if device is not None else tensor.clone()
 
 
 class ReadAhead:
@@ -1346,7 +1347,7 @@ class ReadAhead:
                 job = self.waiting.popleft()
                 if job.taken:
                     continue
-                job.future = self.pool.submit(_read_into_memory, job.tensor)
+                job.future = self.pool.submit(_read_to_device, job.tensor, job.device)
                 self.in_flight += job.nbytes
 
     def _release(self, nbytes: int):
@@ -1782,6 +1783,11 @@ def convert_and_load_state_dict_in_model(
     if is_env_variable_true("HF_DEACTIVATE_ASYNC_LOAD") or "disk" in device_map.values():
         thread_pool = None
     elif has_on_the_fly_quantization:
+        # Read-ahead tensors are copied to their device by the workers: also cap them by a quarter of the free memory
+        # of the devices they go to
+        devices = {d for d in device_map.values() if isinstance(d, int) or str(d).startswith("cuda")} if device_map else set()
+        for d in devices:
+            read_ahead_bytes = min(read_ahead_bytes, torch.cuda.mem_get_info(torch.device("cuda", d) if isinstance(d, int) else d)[0] // 4)
         thread_pool = ReadAhead(GLOBAL_WORKERS, read_ahead_bytes) if read_ahead_bytes > 0 else None
     else:
         thread_pool = ThreadPoolExecutor(max_workers=GLOBAL_WORKERS)
