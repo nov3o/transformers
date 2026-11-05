@@ -1388,9 +1388,13 @@ class ReadAhead:
     the main thread, one tensor at a time, so device memory is the same as with sequential loading: only the reads
     from disk overlap, with each other and with the quantization."""
 
-    def __init__(self, workers: int, budget: int):
+    def __init__(self, workers: int, budget: int, devices=(), device_margin: int = 1 << 30):
         self.pool = ThreadPoolExecutor(max_workers=workers)
         self.budget = budget
+        # Read-ahead copies land on these devices: before each read, check that they still have its size plus a
+        # margin free, so read-ahead shrinks as the quantized model fills the device
+        self.devices = [torch.device("cuda", d) if isinstance(d, int) else torch.device(d) for d in devices]
+        self.device_margin = device_margin
         self.in_flight = 0
         self.waiting = deque()
         self.lock = threading.Lock()
@@ -1406,11 +1410,16 @@ class ReadAhead:
         with self.lock:
             # Always allow one read in flight, so a tensor larger than the budget still loads
             while self.waiting and (self.in_flight == 0 or self.in_flight + self.waiting[0].nbytes <= self.budget):
+                if self.in_flight and not self._device_has_room(self.waiting[0].nbytes):
+                    break
                 job = self.waiting.popleft()
                 if job.taken:
                     continue
                 job.future = self.pool.submit(_read_to_device, job.tensor, job.device)
                 self.in_flight += job.nbytes
+
+    def _device_has_room(self, nbytes: int) -> bool:
+        return all(torch.cuda.mem_get_info(d)[0] >= nbytes + self.device_margin for d in self.devices)
 
     def _release(self, nbytes: int):
         with self.lock:
@@ -1852,7 +1861,7 @@ def convert_and_load_state_dict_in_model(
             read_ahead_bytes = min(read_ahead_bytes, torch.cuda.mem_get_info(torch.device("cuda", d) if isinstance(d, int) else d)[0] // 4)
         # Reading scales with threads (16 readers: ~2.7x faster than sequential on an H100 node with Lustre)
         workers = int(os.environ.get("HF_LOADING_WORKERS", 0)) or min(16, os.cpu_count() or 4)
-        thread_pool = ReadAhead(workers, read_ahead_bytes) if read_ahead_bytes > 0 else None
+        thread_pool = ReadAhead(workers, read_ahead_bytes, devices) if read_ahead_bytes > 0 else None
     else:
         thread_pool = ThreadPoolExecutor(max_workers=GLOBAL_WORKERS)
 
